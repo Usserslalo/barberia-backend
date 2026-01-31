@@ -1,0 +1,39 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// --- ENUMERACIONES ---
+
+enum Role {
+  ADMIN
+  USER
+}
+
+// --- MODELO DE USUARIO Y AUTENTICACIÓN ---
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  role      Role     @default(USER)
+  isActive  Boolean  @default(true)
+
+  // Verificación por WhatsApp (OTP de 6 dígitos, expira en 10 min)
+  verificationCode   String?
+  isVerified         Boolean   @default(false)
+  verificationExpires DateTime?
+
+  // Recuperación de contraseña (OTP independiente del de verificación)
+  resetPasswordCode   String?
+  resetPasswordExpires DateTime?
+
+  // Refresh token (jti) para rotación segura; se limpia en logout
+  refreshToken String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
