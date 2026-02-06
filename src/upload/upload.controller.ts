@@ -17,6 +17,9 @@ import {
 } from '@nestjs/swagger';
 import { Request } from 'express';
 import { diskStorage } from 'multer';
+
+/** Request con archivo subido por Multer; tipo mínimo para evitar depender del namespace Express en build (Render). */
+type RequestWithFile = Omit<Request, 'file'> & { file?: { filename: string } };
 import { extname } from 'path';
 import { randomUUID } from 'crypto';
 import { ROLES } from '../auth/constants/roles';
@@ -87,7 +90,7 @@ export class UploadController {
   @ApiResponse({ status: 400, description: 'Archivo inválido (tipo, tamaño).' })
   @ApiResponse({ status: 401, description: 'No autenticado.' })
   @ApiResponse({ status: 403, description: 'Solo ADMIN.' })
-  async uploadImage(@Req() req: Request & { file?: Express.Multer.File }) {
+  async uploadImage(@Req() req: RequestWithFile) {
     const file = req.file;
     if (!file) {
       throw new BadRequestException('No se recibió ningún archivo. Envíe el campo "file" en multipart/form-data.');
