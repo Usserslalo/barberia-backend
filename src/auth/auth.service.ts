@@ -2,6 +2,8 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  InternalServerErrorException,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -50,24 +52,70 @@ export interface AuthResponse {
   user: {
     id: string;
     email: string;
+    firstName: string | null;
+    lastName: string | null;
+    phone: string | null;
     role: Role;
   };
 }
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly whatsAppService: WhatsAppService,
   ) {}
 
+  /**
+   * Sanitiza y normaliza un email (lowercase, trim).
+   */
+  private sanitizeEmail(email: string): string {
+    return email.trim().toLowerCase();
+  }
+
+  /**
+   * Valida que un string sea un UUID válido (formato estándar 8-4-4-4-12).
+   * Acepta cualquier variante (v4, nil, o IDs fijos usados en seeds) para no rechazar
+   * IDs generados por Prisma o usados en datos de prueba.
+   */
+  private validateUUID(id: string, fieldName: string): void {
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!id || typeof id !== 'string' || !uuidRegex.test(id)) {
+      this.logger.warn(`UUID inválido recibido en ${fieldName}: ${id}`);
+      throw new BadRequestException(`${fieldName} inválido`);
+    }
+  }
+
   async login(dto: LoginDto): Promise<AuthResponse> {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const sanitizedEmail = this.sanitizeEmail(dto.email);
+
+    let user;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { email: sanitizedEmail },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          phone: true,
+          role: true,
+          password: true,
+          isActive: true,
+          isVerified: true,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error en login al buscar usuario: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al procesar la solicitud');
+    }
 
     if (!user) {
+      // Delay para evitar timing attacks
+      await new Promise((resolve) => setTimeout(resolve, 100));
       throw new UnauthorizedException('Credenciales inválidas');
     }
 
@@ -75,7 +123,15 @@ export class AuthService {
       throw new UnauthorizedException('Cuenta desactivada');
     }
 
-    const isPasswordValid = await bcrypt.compare(dto.password, user.password);
+    // bcrypt.compare puede lanzar excepción si el hash está corrupto
+    let isPasswordValid = false;
+    try {
+      isPasswordValid = await bcrypt.compare(dto.password, user.password);
+    } catch (error) {
+      this.logger.error(`Error en bcrypt.compare para usuario ${user.id}: ${error.message}`);
+      throw new UnauthorizedException('Credenciales inválidas');
+    }
+
     if (!isPasswordValid) {
       throw new UnauthorizedException('Credenciales inválidas');
     }
@@ -93,6 +149,9 @@ export class AuthService {
       user: {
         id: user.id,
         email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        phone: user.phone,
         role: user.role,
       },
     };
@@ -110,17 +169,30 @@ export class AuthService {
     const jti = randomUUID();
     const refreshPayload: RefreshTokenPayload = { ...payload, jti };
 
-    const access_token = this.jwtService.sign(payload, {
-      expiresIn: ACCESS_TOKEN_EXPIRES_SEC,
-    });
-    const refresh_token = this.jwtService.sign(refreshPayload, {
-      expiresIn: REFRESH_TOKEN_EXPIRES_SEC,
-    });
+    let access_token: string;
+    let refresh_token: string;
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { refreshToken: jti },
-    });
+    try {
+      access_token = this.jwtService.sign(payload, {
+        expiresIn: ACCESS_TOKEN_EXPIRES_SEC,
+      });
+      refresh_token = this.jwtService.sign(refreshPayload, {
+        expiresIn: REFRESH_TOKEN_EXPIRES_SEC,
+      });
+    } catch (error) {
+      this.logger.error(`Error al firmar tokens para usuario ${userId}: ${error.message}`);
+      throw new InternalServerErrorException('Error al generar tokens de autenticación');
+    }
+
+    try {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { refreshToken: jti },
+      });
+    } catch (error) {
+      this.logger.error(`Error al persistir refreshToken para usuario ${userId}: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al completar la autenticación');
+    }
 
     return { access_token, refresh_token };
   }
@@ -129,20 +201,55 @@ export class AuthService {
    * Refresh tokens (Token Rotation): valida refresh_token, compara jti con BD, emite nuevo par.
    */
   async refreshTokens(refreshToken: string): Promise<AuthResponse> {
+    if (!refreshToken || typeof refreshToken !== 'string' || refreshToken.trim() === '') {
+      throw new UnauthorizedException('Refresh token inválido');
+    }
+
     let payload: RefreshTokenPayload;
     try {
       payload = this.jwtService.verify<RefreshTokenPayload>(refreshToken);
-    } catch {
+    } catch (error) {
+      this.logger.warn(`Refresh token inválido o expirado: ${error.message}`);
       throw new UnauthorizedException('Refresh token inválido o expirado');
     }
 
     const { sub, jti } = payload;
-    const user = await this.prisma.user.findUnique({
-      where: { id: sub },
-      select: { id: true, email: true, role: true, refreshToken: true, isActive: true },
-    });
 
-    if (!user || !user.isActive || user.refreshToken !== jti) {
+    if (!sub || !jti) {
+      this.logger.warn('Refresh token sin sub o jti');
+      throw new UnauthorizedException('Refresh token inválido');
+    }
+
+    let user;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { id: sub },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          phone: true,
+          role: true,
+          refreshToken: true,
+          isActive: true,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error al buscar usuario en refreshTokens: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al procesar la solicitud');
+    }
+
+    if (!user) {
+      throw new UnauthorizedException('Refresh token inválido o ya utilizado');
+    }
+
+    if (!user.isActive) {
+      throw new UnauthorizedException('Cuenta desactivada');
+    }
+
+    if (!user.refreshToken || user.refreshToken !== jti) {
+      this.logger.warn(`Intento de reutilización de refresh token para usuario ${user.id}`);
       throw new UnauthorizedException('Refresh token inválido o ya utilizado');
     }
 
@@ -153,6 +260,9 @@ export class AuthService {
       user: {
         id: user.id,
         email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        phone: user.phone,
         role: user.role,
       },
     };
@@ -162,10 +272,18 @@ export class AuthService {
    * Logout: limpia refreshToken del usuario en BD (invalida sesión para rotación).
    */
   async logout(userId: string): Promise<{ message: string }> {
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { refreshToken: null },
-    });
+    this.validateUUID(userId, 'userId');
+
+    try {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { refreshToken: null },
+      });
+    } catch (error) {
+      this.logger.error(`Error al hacer logout para usuario ${userId}: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al cerrar sesión');
+    }
+
     return { message: 'Sesión cerrada correctamente.' };
   }
 
@@ -173,26 +291,52 @@ export class AuthService {
    * Cambio de contraseña (protegido por JWT). Valida contraseña actual; invalida refresh tokens.
    */
   async changePassword(userId: string, dto: ChangePasswordDto): Promise<{ message: string }> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, password: true },
-    });
+    this.validateUUID(userId, 'userId');
+
+    let user;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, password: true },
+      });
+    } catch (error) {
+      this.logger.error(`Error al buscar usuario en changePassword: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al procesar la solicitud');
+    }
 
     if (!user) {
       throw new UnauthorizedException('Usuario no encontrado');
     }
 
-    const isCurrentValid = await bcrypt.compare(dto.currentPassword, user.password);
+    let isCurrentValid = false;
+    try {
+      isCurrentValid = await bcrypt.compare(dto.currentPassword, user.password);
+    } catch (error) {
+      this.logger.error(`Error en bcrypt.compare en changePassword: ${error.message}`);
+      throw new UnauthorizedException('Contraseña actual incorrecta');
+    }
+
     if (!isCurrentValid) {
       throw new UnauthorizedException('Contraseña actual incorrecta');
     }
 
-    const hashedPassword = await bcrypt.hash(dto.newPassword, SALT_ROUNDS);
+    let hashedPassword: string;
+    try {
+      hashedPassword = await bcrypt.hash(dto.newPassword, SALT_ROUNDS);
+    } catch (error) {
+      this.logger.error(`Error al hashear nueva contraseña: ${error.message}`);
+      throw new InternalServerErrorException('Error al actualizar contraseña');
+    }
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { password: hashedPassword, refreshToken: null },
-    });
+    try {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { password: hashedPassword, refreshToken: null },
+      });
+    } catch (error) {
+      this.logger.error(`Error al actualizar contraseña en BD: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al actualizar contraseña');
+    }
 
     return { message: 'Contraseña actualizada correctamente. Inicie sesión de nuevo.' };
   }
@@ -201,11 +345,22 @@ export class AuthService {
    * Reenvío de OTP de verificación. Mensaje genérico para evitar user enumeration.
    */
   async resendOtp(dto: ResendOtpDto): Promise<{ message: string }> {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const sanitizedEmail = this.sanitizeEmail(dto.email);
+
+    let user;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { email: sanitizedEmail },
+      });
+    } catch (error) {
+      this.logger.error(`Error en resendOtp al buscar usuario: ${error.message}`, error.stack);
+      // Devolver mensaje genérico para no revelar el error
+      return { message: RESEND_OTP_RESPONSE_MESSAGE };
+    }
 
     if (!user) {
+      // Delay para evitar timing attacks
+      await new Promise((resolve) => setTimeout(resolve, 100));
       return { message: RESEND_OTP_RESPONSE_MESSAGE };
     }
 
@@ -214,12 +369,22 @@ export class AuthService {
       Date.now() + VERIFICATION_EXPIRES_MINUTES * 60 * 1000,
     );
 
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: { verificationCode, verificationExpires },
-    });
+    try {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { verificationCode, verificationExpires },
+      });
+    } catch (error) {
+      this.logger.error(`Error al actualizar código de verificación: ${error.message}`, error.stack);
+      return { message: RESEND_OTP_RESPONSE_MESSAGE };
+    }
 
-    this.whatsAppService.sendVerificationCode(verificationCode);
+    try {
+      await this.whatsAppService.sendVerificationCode(user.phone, verificationCode);
+    } catch (error) {
+      this.logger.error(`Error al enviar código de verificación por WhatsApp: ${error.message}`);
+      // No lanzar error, devolver mensaje genérico
+    }
 
     return { message: RESEND_OTP_RESPONSE_MESSAGE };
   }
@@ -228,9 +393,17 @@ export class AuthService {
    * Registro: crea un User básico (rol USER por defecto) y envía OTP por WhatsApp.
    */
   async register(dto: RegisterDto): Promise<AuthResponse> {
-    const existing = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const sanitizedEmail = this.sanitizeEmail(dto.email);
+
+    let existing;
+    try {
+      existing = await this.prisma.user.findUnique({
+        where: { email: sanitizedEmail },
+      });
+    } catch (error) {
+      this.logger.error(`Error al verificar email existente en register: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al procesar el registro');
+    }
 
     if (existing) {
       throw new ConflictException(
@@ -238,30 +411,53 @@ export class AuthService {
       );
     }
 
-    const hashedPassword = await bcrypt.hash(dto.password, SALT_ROUNDS);
+    let hashedPassword: string;
+    try {
+      hashedPassword = await bcrypt.hash(dto.password, SALT_ROUNDS);
+    } catch (error) {
+      this.logger.error(`Error al hashear contraseña en register: ${error.message}`);
+      throw new InternalServerErrorException('Error al procesar el registro');
+    }
 
     const verificationCode = this.generateOtp();
     const verificationExpires = new Date(
       Date.now() + VERIFICATION_EXPIRES_MINUTES * 60 * 1000,
     );
 
-    const user = await this.prisma.user.create({
-      data: {
-        email: dto.email,
-        password: hashedPassword,
-        role: ROLES.USER,
-        isVerified: false,
-        verificationCode,
-        verificationExpires,
-      },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-      },
-    });
+    let user;
+    try {
+      user = await this.prisma.user.create({
+        data: {
+          email: sanitizedEmail,
+          password: hashedPassword,
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+          phone: dto.phone,
+          role: ROLES.USER,
+          isVerified: false,
+          verificationCode,
+          verificationExpires,
+        },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          phone: true,
+          role: true,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error al crear usuario en BD: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al crear la cuenta');
+    }
 
-    this.whatsAppService.sendVerificationCode(verificationCode);
+    try {
+      await this.whatsAppService.sendVerificationCode(user.phone, verificationCode);
+    } catch (error) {
+      this.logger.error(`Error al enviar código de verificación por WhatsApp: ${error.message}`);
+      // No lanzar error; el usuario ya fue creado y puede usar resend-otp
+    }
 
     const tokens = await this.issueTokenPair(user.id, user.email, user.role);
 
@@ -270,6 +466,9 @@ export class AuthService {
       user: {
         id: user.id,
         email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        phone: user.phone,
         role: user.role,
       },
     };
@@ -290,11 +489,21 @@ export class AuthService {
    * Siempre devuelve el mismo mensaje genérico (exista o no el usuario) para evitar user enumeration.
    */
   async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const sanitizedEmail = this.sanitizeEmail(dto.email);
+
+    let user;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { email: sanitizedEmail },
+      });
+    } catch (error) {
+      this.logger.error(`Error en forgotPassword al buscar usuario: ${error.message}`, error.stack);
+      return { message: FORGOT_PASSWORD_RESPONSE_MESSAGE };
+    }
 
     if (!user) {
+      // Delay para evitar timing attacks
+      await new Promise((resolve) => setTimeout(resolve, 100));
       return { message: FORGOT_PASSWORD_RESPONSE_MESSAGE };
     }
 
@@ -303,15 +512,25 @@ export class AuthService {
       Date.now() + RESET_PASSWORD_EXPIRES_MINUTES * 60 * 1000,
     );
 
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: {
-        resetPasswordCode,
-        resetPasswordExpires,
-      },
-    });
+    try {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          resetPasswordCode,
+          resetPasswordExpires,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error al actualizar código de reset: ${error.message}`, error.stack);
+      return { message: FORGOT_PASSWORD_RESPONSE_MESSAGE };
+    }
 
-    this.whatsAppService.sendResetPasswordCode(resetPasswordCode);
+    try {
+      await this.whatsAppService.sendResetPasswordCode(user.phone, resetPasswordCode);
+    } catch (error) {
+      this.logger.error(`Error al enviar código de reset por WhatsApp: ${error.message}`);
+      // No lanzar error, devolver mensaje genérico
+    }
 
     return { message: FORGOT_PASSWORD_RESPONSE_MESSAGE };
   }
@@ -321,9 +540,17 @@ export class AuthService {
    * Usa campos resetPasswordCode/resetPasswordExpires (independientes del flujo de verificación).
    */
   async resetPassword(dto: ResetPasswordDto): Promise<{ message: string }> {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const sanitizedEmail = this.sanitizeEmail(dto.email);
+
+    let user;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { email: sanitizedEmail },
+      });
+    } catch (error) {
+      this.logger.error(`Error en resetPassword al buscar usuario: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al procesar la solicitud');
+    }
 
     if (!user) {
       throw new BadRequestException('Código inválido o expirado. Solicite uno nuevo.');
@@ -343,16 +570,27 @@ export class AuthService {
       throw new UnauthorizedException('Código de restablecimiento incorrecto');
     }
 
-    const hashedPassword = await bcrypt.hash(dto.newPassword, SALT_ROUNDS);
+    let hashedPassword: string;
+    try {
+      hashedPassword = await bcrypt.hash(dto.newPassword, SALT_ROUNDS);
+    } catch (error) {
+      this.logger.error(`Error al hashear nueva contraseña en resetPassword: ${error.message}`);
+      throw new InternalServerErrorException('Error al restablecer contraseña');
+    }
 
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: {
-        password: hashedPassword,
-        resetPasswordCode: null,
-        resetPasswordExpires: null,
-      },
-    });
+    try {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          password: hashedPassword,
+          resetPasswordCode: null,
+          resetPasswordExpires: null,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error al actualizar contraseña en resetPassword: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al restablecer contraseña');
+    }
 
     return { message: 'Contraseña restablecida correctamente. Ya puede iniciar sesión.' };
   }
@@ -361,9 +599,17 @@ export class AuthService {
    * Verifica el código WhatsApp y marca la cuenta como verificada.
    */
   async verifyWhatsApp(dto: VerifyWhatsAppDto): Promise<{ message: string }> {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const sanitizedEmail = this.sanitizeEmail(dto.email);
+
+    let user;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { email: sanitizedEmail },
+      });
+    } catch (error) {
+      this.logger.error(`Error en verifyWhatsApp al buscar usuario: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al procesar la solicitud');
+    }
 
     if (!user) {
       throw new UnauthorizedException('Usuario no encontrado');
@@ -383,14 +629,19 @@ export class AuthService {
       throw new UnauthorizedException('Código de verificación incorrecto');
     }
 
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: {
-        isVerified: true,
-        verificationCode: null,
-        verificationExpires: null,
-      },
-    });
+    try {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          isVerified: true,
+          verificationCode: null,
+          verificationExpires: null,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error al marcar usuario como verificado: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al verificar la cuenta');
+    }
 
     return { message: 'Cuenta verificada correctamente. Ya puede iniciar sesión.' };
   }
@@ -399,36 +650,59 @@ export class AuthService {
    * Valida que el usuario exista, esté activo y verificado (útil para JwtStrategy).
    */
   async validateUserById(userId: string) {
-    return this.prisma.user.findFirst({
-      where: {
-        id: userId,
-        isActive: true,
-        isVerified: true,
-      },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-      },
-    });
+    if (!userId || typeof userId !== 'string') {
+      this.logger.warn('validateUserById llamado con userId inválido');
+      return null;
+    }
+
+    try {
+      return await this.prisma.user.findFirst({
+        where: {
+          id: userId,
+          isActive: true,
+          isVerified: true,
+        },
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          barberId: true,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error en validateUserById: ${error.message}`, error.stack);
+      return null;
+    }
   }
 
   /**
    * Obtiene el perfil del usuario autenticado (id, email, role, isVerified). Nunca devuelve password.
    */
   async getProfile(userId: string) {
-    const user = await this.prisma.user.findFirst({
-      where: {
-        id: userId,
-        isActive: true,
-      },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        isVerified: true,
-      },
-    });
+    this.validateUUID(userId, 'userId');
+
+    let user;
+    try {
+      user = await this.prisma.user.findFirst({
+        where: {
+          id: userId,
+          isActive: true,
+        },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          phone: true,
+          role: true,
+          isVerified: true,
+          barberId: true,
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Error en getProfile al buscar usuario: ${error.message}`, error.stack);
+      throw new InternalServerErrorException('Error al obtener el perfil');
+    }
 
     if (!user) {
       throw new UnauthorizedException('Usuario no encontrado o inactivo');
@@ -437,8 +711,12 @@ export class AuthService {
     return {
       id: user.id,
       email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      phone: user.phone,
       role: user.role,
       isVerified: user.isVerified,
+      ...(user.barberId != null && { barberId: user.barberId }),
     };
   }
 }

@@ -7,6 +7,8 @@ export interface JwtValidatedUser {
   userId: string;
   email: string;
   role: string;
+  /** Solo presente cuando el usuario tiene rol BARBER y está vinculado a un barbero */
+  barberId?: string;
 }
 
 const jwtSecret: string = process.env.JWT_SECRET ?? '';
@@ -35,6 +37,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       userId: user.id,
       email: user.email,
       role: user.role,
+      ...(user.barberId != null && { barberId: user.barberId }),
     };
   }
 }

@@ -1,6 +1,20 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Patch, Post, UseGuards, UseInterceptors } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Patch,
+  Post,
+  Req,
+  Res,
+  UnauthorizedException,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import type { Request, Response } from 'express';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { Public } from './decorators/public.decorator';
 import { AuthService, AuthResponse } from './auth.service';
@@ -16,8 +30,14 @@ import { VerifyWhatsAppDto } from './dto/verify-whatsapp.dto';
 import { ThrottlerLoggingInterceptor } from './interceptors/throttler-logging.interceptor';
 import type { JwtValidatedUser } from './strategies/jwt.strategy';
 
-/** Límite estricto anti-fuerza bruta: 5 peticiones por minuto en login, verify-whatsapp, reset-password, resend-otp. */
+/** Límite estricto anti-fuerza bruta: 5 peticiones por minuto en login, verify-whatsapp, forgot-password, reset-password, resend-otp. */
 const STRICT_THROTTLE = { default: { limit: 5, ttl: 60000 } };
+
+/** Nombre de la cookie HttpOnly donde se envía el refresh token. */
+const REFRESH_TOKEN_COOKIE_NAME = 'refreshToken';
+
+/** Duración del refresh token: 7 días (en ms). */
+const REFRESH_TOKEN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 @ApiTags('auth')
 @Controller('auth')
@@ -26,6 +46,38 @@ const STRICT_THROTTLE = { default: { limit: 5, ttl: 60000 } };
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
+  /**
+   * Opciones para la cookie del refresh token: HttpOnly, Secure (en producción), SameSite=Strict.
+   */
+  private getRefreshTokenCookieOptions(): {
+    httpOnly: boolean;
+    secure: boolean;
+    sameSite: 'strict';
+    maxAge: number;
+    path: string;
+  } {
+    return {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: REFRESH_TOKEN_MAX_AGE_MS,
+      path: '/',
+    };
+  }
+
+  private setRefreshTokenCookie(res: Response, refreshToken: string): void {
+    res.cookie(REFRESH_TOKEN_COOKIE_NAME, refreshToken, this.getRefreshTokenCookieOptions());
+  }
+
+  private clearRefreshTokenCookie(res: Response): void {
+    res.clearCookie(REFRESH_TOKEN_COOKIE_NAME, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/',
+    });
+  }
+
   @Post('login')
   @Public()
   @Throttle(STRICT_THROTTLE)
@@ -33,22 +85,24 @@ export class AuthController {
   @ApiOperation({
     summary: 'Iniciar sesión',
     description:
-      'Valida email y contraseña y devuelve access_token (1h) y refresh_token (7d). Devuelve 401 si las credenciales son inválidas. Rate limit: 5 peticiones/minuto.',
+      'Valida email y contraseña. Devuelve access_token (1h) en el body; refresh_token (7d) en cookie HttpOnly (Secure, SameSite=Strict). Rate limit: 5 peticiones/minuto.',
   })
   @ApiResponse({
     status: 200,
-    description: 'Login exitoso. Devuelve access_token, refresh_token y datos del usuario.',
+    description: 'Login exitoso. access_token en body; refresh_token en cookie HttpOnly.',
     schema: {
       type: 'object',
       properties: {
         access_token: { type: 'string', example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' },
-        refresh_token: { type: 'string', example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' },
         user: {
           type: 'object',
           properties: {
             id: { type: 'string', format: 'uuid' },
             email: { type: 'string', example: 'carlos.mendoza@gmail.com' },
-            role: { type: 'string', enum: ['ADMIN', 'USER'] },
+            firstName: { type: 'string', nullable: true },
+            lastName: { type: 'string', nullable: true },
+            phone: { type: 'string', nullable: true },
+            role: { type: 'string', enum: ['ADMIN', 'USER', 'BARBER'] },
           },
         },
       },
@@ -57,8 +111,13 @@ export class AuthController {
   @ApiResponse({ status: 401, description: 'Credenciales inválidas, cuenta desactivada o no verificada.' })
   @ApiResponse({ status: 400, description: 'Datos de entrada inválidos (validación DTO).' })
   @ApiResponse({ status: 429, description: 'Too Many Requests. Límite de 5 peticiones por minuto excedido.' })
-  async login(@Body() dto: LoginDto): Promise<AuthResponse> {
-    return this.authService.login(dto);
+  async login(
+    @Body() dto: LoginDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<Omit<AuthResponse, 'refresh_token'>> {
+    const result = await this.authService.login(dto);
+    this.setRefreshTokenCookie(res, result.refresh_token);
+    return { access_token: result.access_token, user: result.user };
   }
 
   @Post('register')
@@ -82,6 +141,9 @@ export class AuthController {
           properties: {
             id: { type: 'string', format: 'uuid' },
             email: { type: 'string', example: 'usuario@example.com' },
+            firstName: { type: 'string', nullable: true },
+            lastName: { type: 'string', nullable: true },
+            phone: { type: 'string', nullable: true },
             role: { type: 'string', example: 'USER' },
           },
         },
@@ -120,11 +182,12 @@ export class AuthController {
 
   @Post('forgot-password')
   @Public()
+  @Throttle(STRICT_THROTTLE)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Solicitar recuperación de contraseña',
     description:
-      'Envía un código OTP por WhatsApp al correo indicado (si está registrado). Por seguridad siempre devuelve el mismo mensaje genérico para evitar user enumeration. El código expira en 10 minutos. No requiere Bearer Token.',
+      'Envía un código OTP por WhatsApp al correo indicado (si está registrado). Por seguridad siempre devuelve el mismo mensaje genérico para evitar user enumeration. El código expira en 10 minutos. Rate limit: 5 peticiones/minuto.',
   })
   @ApiResponse({
     status: 200,
@@ -142,6 +205,10 @@ export class AuthController {
   @ApiResponse({
     status: 400,
     description: 'Datos de entrada inválidos (validación DTO).',
+  })
+  @ApiResponse({
+    status: 429,
+    description: 'Too Many Requests. Límite de 5 peticiones por minuto excedido.',
   })
   async forgotPassword(@Body() dto: ForgotPasswordDto): Promise<{ message: string }> {
     return this.authService.forgotPassword(dto);
@@ -182,31 +249,44 @@ export class AuthController {
   @ApiOperation({
     summary: 'Refrescar tokens (Token Rotation)',
     description:
-      'Recibe el refresh_token, lo valida y compara con el jti persistido en BD. Emite un nuevo par access_token (1h) y refresh_token (7d). Invalida el refresh anterior. No requiere Bearer Token.',
+      'Lee el refresh_token desde la cookie HttpOnly (o body si se envía). Valida y compara con el jti en BD. Emite nuevo access_token (1h) en body y nuevo refresh_token (7d) en cookie. Invalida el anterior.',
   })
   @ApiResponse({
     status: 200,
-    description: 'Nuevo par de tokens emitido.',
+    description: 'Nuevo access_token en body; nuevo refresh_token en cookie HttpOnly.',
     schema: {
       type: 'object',
       properties: {
         access_token: { type: 'string' },
-        refresh_token: { type: 'string' },
         user: {
           type: 'object',
           properties: {
             id: { type: 'string', format: 'uuid' },
             email: { type: 'string' },
-            role: { type: 'string', enum: ['ADMIN', 'USER'] },
+            firstName: { type: 'string', nullable: true },
+            lastName: { type: 'string', nullable: true },
+            phone: { type: 'string', nullable: true },
+            role: { type: 'string', enum: ['ADMIN', 'USER', 'BARBER'] },
           },
         },
       },
     },
   })
-  @ApiResponse({ status: 401, description: 'Refresh token inválido, expirado o ya utilizado.' })
+  @ApiResponse({ status: 401, description: 'Refresh token no presente, inválido, expirado o ya utilizado.' })
   @ApiResponse({ status: 400, description: 'Datos de entrada inválidos (validación DTO).' })
-  async refresh(@Body() dto: RefreshTokenDto): Promise<AuthResponse> {
-    return this.authService.refreshTokens(dto.refreshToken);
+  async refresh(
+    @Req() req: Request,
+    @Body() dto: RefreshTokenDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<Omit<AuthResponse, 'refresh_token'>> {
+    const token =
+      (req.cookies?.[REFRESH_TOKEN_COOKIE_NAME] as string | undefined) ?? dto?.refreshToken;
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      throw new UnauthorizedException('Refresh token no presente');
+    }
+    const result = await this.authService.refreshTokens(token);
+    this.setRefreshTokenCookie(res, result.refresh_token);
+    return { access_token: result.access_token, user: result.user };
   }
 
   @Post('resend-otp')
@@ -242,7 +322,8 @@ export class AuthController {
   @ApiBearerAuth('access_token')
   @ApiOperation({
     summary: 'Cerrar sesión',
-    description: 'Limpia el refreshToken del usuario en BD. Requiere Bearer Token. Invalida la sesión para rotación.',
+    description:
+      'Limpia el refreshToken en BD y elimina la cookie HttpOnly del refresh token. Requiere Bearer Token.',
   })
   @ApiResponse({
     status: 200,
@@ -250,8 +331,13 @@ export class AuthController {
     schema: { type: 'object', properties: { message: { type: 'string', example: 'Sesión cerrada correctamente.' } } },
   })
   @ApiResponse({ status: 401, description: 'Token inválido o expirado.' })
-  async logout(@CurrentUser() user: JwtValidatedUser): Promise<{ message: string }> {
-    return this.authService.logout(user.userId);
+  async logout(
+    @CurrentUser() user: JwtValidatedUser,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ message: string }> {
+    const result = await this.authService.logout(user.userId);
+    this.clearRefreshTokenCookie(res);
+    return result;
   }
 
   @Patch('change-password')

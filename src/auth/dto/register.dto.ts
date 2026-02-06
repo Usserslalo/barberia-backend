@@ -11,6 +11,33 @@ export class RegisterDto {
   email: string;
 
   @ApiProperty({
+    example: 'Juan',
+    description: 'Nombre del usuario',
+  })
+  @IsString()
+  @IsNotEmpty({ message: 'El nombre es obligatorio' })
+  firstName: string;
+
+  @ApiProperty({
+    example: 'Pérez',
+    description: 'Apellido del usuario',
+  })
+  @IsString()
+  @IsNotEmpty({ message: 'El apellido es obligatorio' })
+  lastName: string;
+
+  @ApiProperty({
+    example: '+5215512345678',
+    description: 'Teléfono en formato E.164 (ej: +5215512345678 para México)',
+  })
+  @IsString()
+  @IsNotEmpty({ message: 'El teléfono es obligatorio' })
+  @Matches(/^\+[1-9]\d{6,14}$/, {
+    message: 'El teléfono debe estar en formato internacional E.164 (ej: +5215512345678)',
+  })
+  phone: string;
+
+  @ApiProperty({
     example: 'MiClave#123',
     description: 'Contraseña (mínimo 6 caracteres, al menos una letra y un número)',
     minLength: 6,

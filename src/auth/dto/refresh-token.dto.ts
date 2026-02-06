@@ -1,12 +1,17 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsString } from 'class-validator';
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsOptional, IsString } from 'class-validator';
 
+/**
+ * El refresh token puede enviarse en cookie HttpOnly (recomendado) o en el body.
+ * Si se envía en cookie, el body puede estar vacío.
+ */
 export class RefreshTokenDto {
-  @ApiProperty({
+  @ApiPropertyOptional({
     example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
-    description: 'Refresh token JWT emitido en login o refresh anterior',
+    description:
+      'Refresh token JWT (opcional si se envía en cookie HttpOnly). Prioridad: cookie > body.',
   })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty({ message: 'El refresh token es obligatorio' })
-  refreshToken: string;
+  refreshToken?: string;
 }

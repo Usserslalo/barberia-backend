@@ -2,17 +2,20 @@ import {
   CallHandler,
   ExecutionContext,
   Injectable,
+  Logger,
   NestInterceptor,
 } from '@nestjs/common';
 import { Observable } from 'rxjs';
 import { tap } from 'rxjs/operators';
 
 /**
- * Interceptor temporal para verificar que el Throttler está evaluando las peticiones.
- * Logea IP y ruta; puede eliminarse cuando se confirme el rate limiting.
+ * Interceptor para registrar que el Throttler está evaluando las peticiones.
+ * Logea IP y ruta con el Logger de NestJS.
  */
 @Injectable()
 export class ThrottlerLoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(ThrottlerLoggingInterceptor.name);
+
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
     const httpCtx = context.switchToHttp();
     const req = httpCtx.getRequest<{ ip?: string; url?: string; route?: { path?: string } }>();
@@ -20,7 +23,7 @@ export class ThrottlerLoggingInterceptor implements NestInterceptor {
     const handlerName = context.getHandler()?.name ?? 'unknown';
     const routePath = req.route?.path ?? req.url ?? 'unknown';
 
-    console.log('[Throttler] Evaluando petición | IP:', ip, '| Ruta:', routePath, '| Handler:', handlerName);
+    this.logger.debug(`Evaluando petición | IP: ${ip} | Ruta: ${routePath} | Handler: ${handlerName}`);
 
     return next.handle().pipe(
       tap(() => {

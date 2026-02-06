@@ -7,6 +7,7 @@ import { Role } from '@prisma/client';
 export const ROLES = {
   ADMIN: 'ADMIN' as Role,
   USER: 'USER' as Role,
+  BARBER: 'BARBER' as Role,
 } as const;
 
 export type RoleType = Role;

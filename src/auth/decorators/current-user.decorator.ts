@@ -6,12 +6,15 @@ import { JwtValidatedUser } from '../strategies/jwt.strategy';
  * Requiere JwtAuthGuard en la ruta.
  */
 export const CurrentUser = createParamDecorator(
-  (data: keyof JwtValidatedUser | undefined, ctx: ExecutionContext): JwtValidatedUser | string => {
+  (
+    data: keyof JwtValidatedUser | undefined,
+    ctx: ExecutionContext,
+  ): JwtValidatedUser | JwtValidatedUser[keyof JwtValidatedUser] => {
     const request = ctx.switchToHttp().getRequest<{ user: JwtValidatedUser }>();
     const user = request.user;
 
     if (data) {
-      return user[data];
+      return user[data] as JwtValidatedUser[keyof JwtValidatedUser];
     }
 
     return user;

@@ -1,4 +1,4 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 
 /**
@@ -12,7 +12,16 @@ export class MeResponseDto {
   @ApiProperty({ example: 'usuario@ejemplo.com', description: 'Email del usuario' })
   email: string;
 
-  @ApiProperty({ enum: ['ADMIN', 'USER'], description: 'Rol del usuario' })
+  @ApiProperty({ example: 'Juan', description: 'Nombre del usuario', nullable: true })
+  firstName: string | null;
+
+  @ApiProperty({ example: 'Pérez', description: 'Apellido del usuario', nullable: true })
+  lastName: string | null;
+
+  @ApiProperty({ example: '+34912345678', description: 'Teléfono del usuario', nullable: true })
+  phone: string | null;
+
+  @ApiProperty({ enum: ['ADMIN', 'USER', 'BARBER'], description: 'Rol del usuario' })
   role: Role;
 
   @ApiProperty({
@@ -20,4 +29,10 @@ export class MeResponseDto {
     example: true,
   })
   isVerified: boolean;
+
+  @ApiPropertyOptional({
+    description: 'ID del perfil Barber vinculado. Solo presente cuando el usuario tiene rol BARBER.',
+    example: 'uuid-barber',
+  })
+  barberId?: string;
 }

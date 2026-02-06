@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "Barber" ADD COLUMN "bio" TEXT;
+ALTER TABLE "Barber" ADD COLUMN "displayOrder" INTEGER NOT NULL DEFAULT 0;

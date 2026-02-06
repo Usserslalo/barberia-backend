@@ -11,29 +11,206 @@ datasource db {
 enum Role {
   ADMIN
   USER
+  BARBER
 }
 
-// --- MODELO DE USUARIO Y AUTENTICACIÓN ---
+enum AppointmentStatus {
+  PENDING    // Creada, esperando aceptación del barbero
+  ACCEPTED   // Aceptada por el barbero
+  REJECTED   // Rechazada (obligatorio rejectionReason)
+  CANCELLED  // Cancelada por cliente o barbería
+  COMPLETED  // Realizada (puntos de lealtad al pasar aquí)
+}
+
+// --- CORE: USUARIOS Y LEALTAD ---
 
 model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  password  String
-  role      Role     @default(USER)
-  isActive  Boolean  @default(true)
+  id                String   @id @default(uuid())
+  email             String   @unique
+  password          String
+  firstName         String?
+  lastName          String?
+  phone             String    // Obligatorio para WhatsApp OTP (formato E.164)
+  role              Role     @default(USER)
+  isActive          Boolean  @default(true)
+  
+  // Sistema de Lealtad (Gamificación)
+  loyaltyPoints     Int      @default(0) // Se suma +1 automáticamente al completar cita
+  totalVisits       Int      @default(0)
 
-  // Verificación por WhatsApp (OTP de 6 dígitos, expira en 10 min)
-  verificationCode   String?
-  isVerified         Boolean   @default(false)
-  verificationExpires DateTime?
-
-  // Recuperación de contraseña (OTP independiente del de verificación)
-  resetPasswordCode   String?
+  // Seguridad y OTP (WhatsApp)
+  verificationCode     String?
+  isVerified           Boolean   @default(false)
+  verificationExpires  DateTime?
+  resetPasswordCode    String?
   resetPasswordExpires DateTime?
+  refreshToken         String?   // Para Token Rotation
 
-  // Refresh token (jti) para rotación segura; se limpia en logout
-  refreshToken String?
+  // Relación opcional uno-a-uno con Barber (cuando el usuario es barbero)
+  barberId          String?  @unique
+  barber            Barber?  @relation(fields: [barberId], references: [id])
 
+  // Relaciones
+  appointments      Appointment[]
+  slotLocks         SlotLock[]
+  auditLogs         AuditLog[]  // Auditoría de acciones admin (landing-admin)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+// --- NEGOCIO: CATEGORÍAS, SERVICIOS Y BARBEROS ---
+
+model ServiceCategory {
+  id        String    @id @default(uuid())
+  name      String    // ej. "Corte", "Barba"
+  slug      String    @unique // ej. "corte", "barba"
+  color     String?   // ej. "#3B82F6" para UI
+  isActive  Boolean   @default(true)
+  services  Service[]
+}
+
+model Service {
+  id               String           @id @default(uuid())
+  name             String           // Ej: "Corte Clásico"
+  description      String?
+  price            Float
+  durationMinutes  Int             // Vital para el calendario
+  category         String           @default("General") // Legacy: compatibilidad frontend
+  categoryId       String?          // FK opcional a ServiceCategory
+  categoryRelation ServiceCategory? @relation(fields: [categoryId], references: [id])
+  isActive         Boolean         @default(true)
+
+  appointments     Appointment[]
+}
+
+model Barber {
+  id              String   @id @default(uuid())
+  name            String   // Nombre artístico
+  roleDescription String   // Ej: "Top Barber Stylist"
+  bio             String?  @db.Text // Biografía corta para landing (opcional)
+  photoUrl        String?
+  experienceYears Int      @default(0)
+  displayOrder    Int      @default(0) // Orden de aparición en landing (menor = primero)
+  isActive        Boolean  @default(true)
+
+  user            User?    // Usuario que hace login como este barbero (opcional)
+  appointments     Appointment[]
+  workSchedules    BarberWorkSchedule[]
+  slotLocks       SlotLock[]
+}
+
+model BarberWorkSchedule {
+  id         String  @id @default(uuid())
+  barberId   String
+  barber     Barber  @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  dayOfWeek  Int     // 0=Dom, 1=Lun, ..., 6=Sab
+  startTime  String  // "09:00"
+  endTime    String  // "18:00"
+  breakStart String? // "14:00" opcional
+  breakEnd   String? // "15:00" opcional
+  isActive   Boolean @default(true)
+
+  @@unique([barberId, dayOfWeek])
+}
+
+model ScheduleException {
+  id          String   @id @default(uuid())
+  date        DateTime @db.Date // Día festivo o cierre
+  type        String   // "HOLIDAY" | "CLOSED" | "SPECIAL_HOURS"
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// --- OPERACIONES: CITAS ---
+
+model Appointment {
+  id                   String            @id @default(uuid())
+  date                 DateTime          // Fecha y hora de la cita
+  status               AppointmentStatus @default(PENDING)
+  notes                String?           // Notas opcionales del cliente
+  rejectionReason      String?           // Obligatorio cuando status = REJECTED
+  reminderSent         Boolean           @default(false) // Evita recordatorios duplicados (Cron)
+  loyaltyPointsAwarded Boolean           @default(false) // Solo se suman puntos la primera vez que pasa a COMPLETED
+
+  // Relaciones
+  userId      String
+  user        User              @relation(fields: [userId], references: [id])
+  barberId    String
+  barber      Barber            @relation(fields: [barberId], references: [id])
+  serviceId   String
+  service     Service           @relation(fields: [serviceId], references: [id])
+
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+}
+
+// Bloqueo temporal de slot: 5 minutos al seleccionar horario; si no se confirma, se libera.
+model SlotLock {
+  id            String   @id @default(uuid())
+  barberId      String
+  barber        Barber   @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  slotStart     DateTime // Inicio del slot (fecha y hora)
+  lockedByUserId String
+  user          User     @relation(fields: [lockedByUserId], references: [id], onDelete: Cascade)
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+
+  @@unique([barberId, slotStart])
+}
+
+// --- CONTENIDO: LANDING PAGE DINÁMICO (CMS) ---
+
+model LandingConfig {
+  id                  String   @id @default(uuid())
+  // Hero Section
+  heroTitle           String   @default("Bober Barbershop")
+  heroBackgroundImage String   // URL de la imagen de fondo cambiable
+  logoUrl             String
+  
+  // About Section (Izquierda texto, Derecha imagen)
+  aboutTitle          String   @default("O NAC")
+  aboutText           String   @db.Text
+  aboutImageUrl       String
+  
+  // Ubicación y Contacto
+  phone               String
+  email               String
+  instagramUrl        String?
+  whatsappUrl         String?
+  // Credenciales Meta WhatsApp Cloud API (para OTP y notificaciones)
+  whatsappPhoneId     String?
+  whatsappWabaId      String?
+  // Mapa: selector con marcador (prioritario) o iframe legacy
+  latitude            Float?   // Latitud del marcador
+  longitude           Float?   // Longitud del marcador
+  address             String?  // Dirección formateada (geocodificación inversa)
+  googleMapsIframe    String?  @db.Text // Embed del mapa (legacy, si no hay lat/lng)
+  
+  updatedAt           DateTime @updatedAt
+}
+
+model GalleryItem {
+  id          String   @id @default(uuid())
+  imageUrl    String   // Fotos de evidencia
+  description String?
+  createdAt   DateTime @default(now())
+}
+
+// --- AUDITORÍA: LANDING ADMIN ---
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  adminId   String   // Usuario (ADMIN) que realizó la acción
+  admin     User     @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  action    String   // ej. UPDATE_CONFIG, DELETE_BARBER
+  entity    String   // ej. LandingConfig, Barber, Service, GalleryItem
+  entityId  String?  // ID del recurso afectado (null para config si es único)
+  oldData   Json?   // Estado anterior (PATCH/DELETE); null en POST
+  newData   Json?   // Estado nuevo o creado; null si solo se eliminó
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+
+  @@index([adminId])
+  @@index([entity])
+  @@index([createdAt])
 }
