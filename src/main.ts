@@ -41,6 +41,11 @@ async function bootstrap() {
   // Ahora todas tus APIs empezarán con http://localhost:3000/api/...
   app.setGlobalPrefix('api');
 
+  // 4.1 Health check en raíz para Render/plataformas (GET / y HEAD / → 200)
+  const httpAdapter = app.getHttpAdapter();
+  httpAdapter.get('/', (_req, res) => res.status(200).json({ status: 'ok' }));
+  httpAdapter.head('/', (_req, res) => res.status(200).end());
+
   // 5. Configuración de ValidationPipe
   // Esto hace que NestJS valide automáticamente los datos que llegan (DTOs)
   app.useGlobalPipes(
