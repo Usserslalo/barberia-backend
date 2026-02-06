@@ -47,19 +47,22 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   /**
-   * Opciones para la cookie del refresh token: HttpOnly, Secure (en producción), SameSite=Strict.
+   * Opciones para la cookie del refresh token.
+   * En producción: SameSite=None + Secure para que el navegador envíe la cookie en peticiones cross-origin
+   * (front en localhost:4200 o en otro dominio → back en Render). En desarrollo: Strict (mismo origen).
    */
   private getRefreshTokenCookieOptions(): {
     httpOnly: boolean;
     secure: boolean;
-    sameSite: 'strict';
+    sameSite: 'strict' | 'none';
     maxAge: number;
     path: string;
   } {
+    const isProduction = process.env.NODE_ENV === 'production';
     return {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
+      secure: isProduction,
+      sameSite: isProduction ? 'none' : 'strict',
       maxAge: REFRESH_TOKEN_MAX_AGE_MS,
       path: '/',
     };
@@ -70,11 +73,12 @@ export class AuthController {
   }
 
   private clearRefreshTokenCookie(res: Response): void {
+    const opts = this.getRefreshTokenCookieOptions();
     res.clearCookie(REFRESH_TOKEN_COOKIE_NAME, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      path: '/',
+      httpOnly: opts.httpOnly,
+      secure: opts.secure,
+      sameSite: opts.sameSite,
+      path: opts.path,
     });
   }
 
