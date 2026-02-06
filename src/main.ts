@@ -20,7 +20,7 @@ async function bootstrap() {
   // 2. Archivos estáticos: /uploads para imágenes subidas
   app.useStaticAssets(join(process.cwd(), 'uploads'), { prefix: '/uploads/' });
 
-  // 3. CORS dinámico: solo dominios autorizados (anti-leeching). CORS_ORIGINS (varios, separados por coma) o CORS_ORIGIN (uno).
+  // 3. CORS: en producción definir CORS_ORIGIN o CORS_ORIGINS con la URL del frontend para permitir peticiones externas.
   const corsOrigins = process.env.CORS_ORIGINS
     ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
     : process.env.CORS_ORIGIN?.trim()
@@ -71,8 +71,15 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('docs', app, document); // La documentación estará en /docs
 
-  await app.listen(process.env.PORT ?? 3000);
-  console.log(`🚀 Servidor corriendo en: http://localhost:3000/api`);
-  console.log(`📄 Documentación disponible en: http://localhost:3000/docs`);
+  const port = Number(process.env.PORT) || 3000;
+  await app.listen(port);
+  let host: string;
+  try {
+    host = process.env.BASE_URL ? new URL(process.env.BASE_URL).origin : `http://localhost:${port}`;
+  } catch {
+    host = `http://localhost:${port}`;
+  }
+  console.log(`🚀 Servidor corriendo en: ${host}/api`);
+  console.log(`📄 Documentación disponible en: ${host}/docs`);
 }
 bootstrap();
